@@ -2,309 +2,193 @@
 # -*- coding: utf-8 -*-
 
 """
-Auto Git Push Script (Om edition)
+Auto Git Push (heartbeat edition)
 ---------------------------------
-Watches a repo for changes and periodically commits + pushes them.
+- Always writes/updates .autopush_heartbeat.txt so there's something to commit.
+- Auto-initializes git if needed.
+- Auto-adds 'origin' if REMOTE_URL is provided.
+- Ensures upstream and pushes on every cycle.
 
-Features
-- Auto-init Git repo if missing (optional remote attach & first push)
-- Auto-detect current branch (fallback to env or 'main')
-- Ensures upstream is set (handles first push)
-- Clear logs and safe error handling
-- Fully configurable via env vars
+ENV (optional):
+- REPO_PATH=/absolute/path                (default: current working dir)
+- BRANCH_NAME=main                        (default: auto-detect, else 'main')
+- AUTOPUSH_INTERVAL=60                    (seconds; default 60)
+- GIT_USER_NAME="Om-1004"                 (git config --global)
+- GIT_USER_EMAIL="opatel101004@gmail.com" (git config --global)
+- REMOTE_URL="https://github.com/USER/REPO.git"  (or SSH URL)
 
-Environment Variables (all optional)
-- REPO_PATH:           Absolute path to repo (default: current working dir)
-- BRANCH_NAME:         Branch to use (default: auto-detect, then 'main')
-- AUTOPUSH_INTERVAL:   Seconds between checks (default: 60)
-- GIT_USER_NAME:       Git user.name (default: "Om-1004")
-- GIT_USER_EMAIL:      Git user.email (default: "opatel101004@gmail.com")
-- REMOTE_URL:          If set AND repo not yet a git repo, add as origin & do first push
-- CREATE_GITIGNORE:    If "1", create a simple .gitignore on init (default: "1")
-- GITIGNORE_EXTRA:     Extra lines to append to .gitignore (newline-separated)
-
-Examples
-- export REPO_PATH="$HOME/Desktop/for_us_folder"
-- export AUTOPUSH_INTERVAL=43200          # 12 hours
-- export BRANCH_NAME=dev
-- export REMOTE_URL="https://github.com/Om-1004/your-repo.git"
-
-Run
-- python3 auto_git_push.py
+Usage:
+  export REPO_PATH="$HOME/Desktop/for_us_folder"
+  export REMOTE_URL="https://github.com/Om-1004/<YOUR-REPO>.git"
+  python3 auto_git_push.py
 """
 
 import os
 import time
 import subprocess
-from datetime import datetime
 from pathlib import Path
-
+from datetime import datetime
 
 # ----------------------------
-# Configuration (with env vars)
+# Config
 # ----------------------------
-DEFAULT_SLEEP = 60  # seconds
-SLEEP_DURATION = int(os.getenv("AUTOPUSH_INTERVAL", DEFAULT_SLEEP))
+SLEEP_DURATION = int(os.getenv("AUTOPUSH_INTERVAL", "60"))
 REPO_PATH = os.path.abspath(os.getenv("REPO_PATH", os.getcwd()))
 BRANCH_NAME_ENV = os.getenv("BRANCH_NAME", "").strip() or None
+REMOTE_URL = os.getenv("REMOTE_URL", "").strip() or None
 
 GIT_USER_NAME = os.getenv("GIT_USER_NAME", "Om-1004")
 GIT_USER_EMAIL = os.getenv("GIT_USER_EMAIL", "opatel101004@gmail.com")
 
-REMOTE_URL = os.getenv("REMOTE_URL", "").strip() or None
-CREATE_GITIGNORE = os.getenv("CREATE_GITIGNORE", "1").strip() == "1"
-GITIGNORE_EXTRA = os.getenv("GITIGNORE_EXTRA", "")
-
-DEFAULT_GITIGNORE = """\
-__pycache__/
-*.log
-.env
-.DS_Store
-node_modules/
-dist/
-build/
-"""
-
+HEARTBEAT_FILE = ".autopush_heartbeat.txt"
 
 # ----------------------------
 # Helpers
 # ----------------------------
-def run_command(command: str, cwd: str | None = None, check: bool = True) -> tuple[str, bool]:
-    """
-    Run a shell command. Returns (output, success).
-    On failure, returns (stdout or stderr or message, False).
-    """
+def run(cmd, cwd=None, check=True):
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            check=check
-        )
-        return result.stdout.strip(), True
+        r = subprocess.run(cmd, shell=True, cwd=cwd, text=True, capture_output=True, check=check)
+        return r.stdout.strip(), True
     except subprocess.CalledProcessError as e:
         msg = (e.stdout or e.stderr or str(e)).strip()
         return msg, False
 
-
-def is_git_repo(repo_path: str) -> bool:
-    out, ok = run_command("git rev-parse --is-inside-work-tree", cwd=repo_path, check=False)
+def is_git_repo(path):
+    out, ok = run("git rev-parse --is-inside-work-tree", cwd=path, check=False)
     return ok and out.lower() == "true"
 
+def git_config_global():
+    run(f'git config --global user.name "{GIT_USER_NAME}"', check=False)
+    run(f'git config --global user.email "{GIT_USER_EMAIL}"', check=False)
 
-def get_repo_url(repo_path: str) -> str:
-    out, ok = run_command("git config --get remote.origin.url", cwd=repo_path, check=False)
-    return out if (ok and out) else "Unknown"
-
-
-def get_current_branch(repo_path: str) -> str | None:
-    # Try the common ways to detect branch; avoid 'HEAD' (detached)
-    out, ok = run_command("git rev-parse --abbrev-ref HEAD", cwd=repo_path, check=False)
+def get_branch(path):
+    out, ok = run("git rev-parse --abbrev-ref HEAD", cwd=path, check=False)
     if ok and out and out != "HEAD":
         return out
+    out2, ok2 = run("git symbolic-ref --short HEAD", cwd=path, check=False)
+    return out2 if ok2 and out2 else None
 
-    out2, ok2 = run_command("git symbolic-ref --short HEAD", cwd=repo_path, check=False)
-    if ok2 and out2:
-        return out2
-
-    return None  # unknown / detached
-
-
-def checkout_or_create_branch(repo_path: str, branch: str) -> bool:
-    """
-    Checkout the given branch if it exists; otherwise create it.
-    """
-    # Does branch exist locally?
-    _, ok = run_command(f"git rev-parse --verify {branch}", cwd=repo_path, check=False)
+def checkout_or_create_branch(path, branch):
+    _, ok = run(f"git rev-parse --verify {branch}", cwd=path, check=False)
     if ok:
-        _, ok2 = run_command(f"git checkout {branch}", cwd=repo_path, check=False)
+        _, ok2 = run(f"git checkout {branch}", cwd=path, check=False)
         return ok2
-
-    # Try to create from origin/<branch> if remote has it
-    _, has_remote = run_command(f"git ls-remote --heads origin {branch}", cwd=repo_path, check=False)
+    # try origin/<branch>
+    _, has_remote = run(f"git ls-remote --heads origin {branch}", cwd=path, check=False)
     if has_remote:
-        _, ok3 = run_command(f"git checkout -b {branch} --track origin/{branch}", cwd=repo_path, check=False)
+        _, ok3 = run(f"git checkout -b {branch} --track origin/{branch}", cwd=path, check=False)
         return ok3
-
-    # Otherwise create empty local branch
-    _, ok4 = run_command(f"git checkout -b {branch}", cwd=repo_path, check=False)
+    # create empty local
+    _, ok4 = run(f"git checkout -b {branch}", cwd=path, check=False)
     return ok4
 
+def ensure_repo(path, branch_fallback="main"):
+    if not is_git_repo(path):
+        print(f"Git not found in {path}. Initializing...")
+        out, ok = run("git init", cwd=path, check=False)
+        if not ok:
+            print("Failed to init git:", out)
+            return False
+        # make initial commit if empty
+        run("git add -A", cwd=path, check=False)
+        run('git commit -m "Initial commit"', cwd=path, check=False)
+    # ensure we are on some branch
+    branch = get_branch(path) or branch_fallback
+    checkout_or_create_branch(path, branch)
+    return True
 
-def setup_git_config():
-    run_command(f'git config --global user.name "{GIT_USER_NAME}"', check=False)
-    run_command(f'git config --global user.email "{GIT_USER_EMAIL}"', check=False)
+def ensure_origin(path):
+    # if origin exists, no-op
+    out, ok = run("git remote get-url origin", cwd=path, check=False)
+    if ok and out:
+        return True
+    if not REMOTE_URL:
+        print("No 'origin' remote and REMOTE_URL not set. Set REMOTE_URL to add remote automatically.")
+        return False
+    print(f"Adding origin -> {REMOTE_URL}")
+    # remove any stale origin then add
+    run("git remote remove origin", cwd=path, check=False)
+    out, ok = run(f"git remote add origin {REMOTE_URL}", cwd=path, check=False)
+    if not ok:
+        print("Failed to add origin:", out)
+        return False
+    return True
 
-
-def has_changes(repo_path: str) -> bool:
-    out, ok = run_command("git status --porcelain", cwd=repo_path, check=False)
-    return ok and len(out.strip()) > 0
-
-
-def ensure_upstream(repo_path: str, branch: str) -> bool:
-    """
-    Ensure 'origin/<branch>' is set as upstream.
-    If missing, attempt 'git push -u origin <branch>'.
-    """
-    out, ok = run_command(f"git rev-parse --abbrev-ref {branch}@{{upstream}}", cwd=repo_path, check=False)
+def ensure_upstream(path, branch):
+    # is upstream set?
+    _, ok = run(f"git rev-parse --abbrev-ref {branch}@{{upstream}}", cwd=path, check=False)
     if ok:
         return True
-
-    # Try to set upstream (works even if nothing to push, if remote branch exists)
-    _, push_ok = run_command(f"git push -u origin {branch}", cwd=repo_path, check=False)
+    # set upstream (works even if nothing to push if remote branch exists)
+    _, push_ok = run(f"git push -u origin {branch}", cwd=path, check=False)
     return push_ok
 
+def heartbeat(path):
+    """Always write/update a small file to guarantee a change exists."""
+    p = Path(path) / HEARTBEAT_FILE
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    payload = f"[auto-push heartbeat] {now}\n"
+    # append (so file grows slowly and always changes)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(payload)
 
-def commit_all(repo_path: str, message: str) -> bool:
-    _, add_ok = run_command("git add -A", cwd=repo_path, check=False)
-    if not add_ok:
-        return False
+def commit_and_push(path, branch):
+    # stage everything
+    run("git add -A", cwd=path, check=False)
+    msg = f'git commit -m "Auto-commit: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}"'
+    out, ok = run(msg, cwd=path, check=False)
+    # if nothing to commit, ok might be False; we still try to push to ensure upstream
+    _, push_ok = run(f"git push origin {branch}", cwd=path, check=False)
+    return push_ok
 
-    out, commit_ok = run_command(f'git commit -m "{message}"', cwd=repo_path, check=False)
-    if not commit_ok:
-        # Common case: nothing to commit
-        if "nothing to commit" in out.lower():
-            return True
-        return False
-    return True
-
-
-def push(repo_path: str, branch: str) -> bool:
-    _, ok = run_command(f"git push origin {branch}", cwd=repo_path, check=False)
-    return ok
-
-
-def write_gitignore_if_needed(repo_path: str):
-    """
-    Create a starter .gitignore if not present and CREATE_GITIGNORE=1.
-    Append any extra patterns from GITIGNORE_EXTRA (newline-separated).
-    """
-    if not CREATE_GITIGNORE:
-        return
-    gitignore_path = Path(repo_path) / ".gitignore"
-    if not gitignore_path.exists():
-        gitignore_path.write_text(DEFAULT_GITIGNORE, encoding="utf-8")
-
-    if GITIGNORE_EXTRA.strip():
-        with gitignore_path.open("a", encoding="utf-8") as fh:
-            if not DEFAULT_GITIGNORE.endswith("\n"):
-                fh.write("\n")
-            fh.write("\n# Extra patterns from env\n")
-            for line in GITIGNORE_EXTRA.splitlines():
-                fh.write(line.rstrip() + "\n")
-
-
-def ensure_git_repo(repo_path: str, remote_url: str | None, default_branch: str = "main") -> bool:
-    """
-    Ensure repo_path is a git repo. If not:
-      - git init
-      - optional: create .gitignore
-      - initial commit if there are files
-      - optional: add remote origin <remote_url>
-      - create/checkout default_branch
-      - optional: first push to set upstream
-    """
-    if is_git_repo(repo_path):
-        return True
-
-    print(f"Git not initialized at {repo_path}. Initializing repository...")
-    out, ok = run_command("git init", cwd=repo_path, check=False)
-    if not ok:
-        print(f"Error initializing git: {out}")
-        return False
-
-    write_gitignore_if_needed(repo_path)
-
-    # Create first commit if there is anything to commit
-    run_command("git add -A", cwd=repo_path, check=False)
-    # If add had nothing, commit will fail; that's fine.
-    run_command('git commit -m "Initial commit"', cwd=repo_path, check=False)
-
-    # Ensure default branch exists and is checked out
-    # (Some Git configs default to 'master'—we standardize to default_branch)
-    # If we're already on default_branch, this is a no-op.
-    checkout_or_create_branch(repo_path, default_branch)
-
-    if remote_url:
-        print(f"Adding remote 'origin' -> {remote_url}")
-        # Add origin (ignore error if already exists)
-        run_command(f"git remote remove origin", cwd=repo_path, check=False)  # ensure clean state
-        _, add_ok = run_command(f"git remote add origin {remote_url}", cwd=repo_path, check=False)
-        if not add_ok:
-            print("Warning: failed to add remote origin.")
-
-        # First push to set upstream (OK if it fails; user can fix credentials/URL)
-        ensure_upstream(repo_path, default_branch)
-
-    return True
-
+def get_repo_url(path):
+    out, ok = run("git config --get remote.origin.url", cwd=path, check=False)
+    return out if (ok and out) else "Unknown"
 
 # ----------------------------
-# Main loop
+# Main
 # ----------------------------
-def auto_push_loop():
-    print("Starting auto-push script...")
+def main():
+    print("Starting auto-push script (heartbeat mode)...")
     print(f"Local path: {REPO_PATH}")
-
-    if not os.path.exists(REPO_PATH):
+    if not os.path.isdir(REPO_PATH):
         print(f"Error: Path does not exist: {REPO_PATH}")
         return
 
-    setup_git_config()
-
-    # Ensure repo (and optionally set remote + first push)
-    if not ensure_git_repo(REPO_PATH, REMOTE_URL, default_branch=BRANCH_NAME_ENV or "main"):
+    git_config_global()
+    if not ensure_repo(REPO_PATH):
         return
 
-    # Figure out the branch to use
-    branch = BRANCH_NAME_ENV or get_current_branch(REPO_PATH) or "main"
-
-    # If user forced a branch via env, make sure we are on it
+    # decide branch
+    branch = BRANCH_NAME_ENV or get_branch(REPO_PATH) or "main"
     if BRANCH_NAME_ENV:
-        if not checkout_or_create_branch(REPO_PATH, BRANCH_NAME_ENV):
-            print(f"Warning: Could not switch/create branch '{BRANCH_NAME_ENV}'. Continuing on detected branch.")
+        checkout_or_create_branch(REPO_PATH, BRANCH_NAME_ENV)
+        branch = get_branch(REPO_PATH) or branch
 
-        # Re-detect in case checkout succeeded
-        branch = get_current_branch(REPO_PATH) or branch
-
-    repo_url = get_repo_url(REPO_PATH)
-
-    print(f"Repository: {repo_url}")
-    print(f"Branch: {branch}")
-    print(f"Push interval: {SLEEP_DURATION} seconds")
-    print("Press Ctrl+C to stop")
-
-    # Ensure upstream set (best effort)
+    # ensure origin & upstream
+    if not ensure_origin(REPO_PATH):
+        print("Tip: export REMOTE_URL=https://github.com/USER/REPO.git")
     if not ensure_upstream(REPO_PATH, branch):
-        print(f"Warning: Could not set upstream for '{branch}'. "
-              f"Ensure 'origin' exists and credentials are valid (especially on first push).")
+        print(f"Warning: could not set upstream for '{branch}'. Check credentials/remote.")
+
+    print(f"Repository: {get_repo_url(REPO_PATH)}")
+    print(f"Branch: {branch}")
+    print(f"Interval: {SLEEP_DURATION} seconds")
+    print("Press Ctrl+C to stop.\n")
 
     try:
         while True:
-            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"{current_time}: Checking for changes...")
-
-            if has_changes(REPO_PATH):
-                print("Changes detected. Adding, committing, and pushing...")
-                msg = f"Auto-commit: {current_time}"
-                if not commit_all(REPO_PATH, msg):
-                    print("Error: Failed to commit changes.")
-                else:
-                    if push(REPO_PATH, branch):
-                        print(f"Successfully pushed changes at {current_time}")
-                    else:
-                        print(f"Error: Failed to push changes at {current_time}")
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"{now}: Writing heartbeat, committing, pushing...")
+            heartbeat(REPO_PATH)
+            if commit_and_push(REPO_PATH, branch):
+                print("✓ Pushed.")
             else:
-                print("No changes detected.")
-
-            print(f"Waiting {SLEEP_DURATION} seconds until next check...")
+                print("✗ Push failed (check remote/credentials).")
+            print(f"Sleeping {SLEEP_DURATION}s...\n")
             time.sleep(SLEEP_DURATION)
-
     except KeyboardInterrupt:
         print("\nStopping auto-push script...")
 
-
 if __name__ == "__main__":
-    auto_push_loop()
+    main()
